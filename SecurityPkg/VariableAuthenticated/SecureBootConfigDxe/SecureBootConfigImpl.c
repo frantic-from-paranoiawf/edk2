@@ -2526,6 +2526,7 @@ UpdateDeletePage (
   IN EFI_QUESTION_ID                 QuestionIdBase
   )
 {
+
   EFI_STATUS          Status;
   UINT32              Index;
   UINTN               CertCount;
@@ -2539,16 +2540,23 @@ UpdateDeletePage (
   EFI_SIGNATURE_LIST  *CertList;
   EFI_SIGNATURE_DATA  *Cert;
   UINT32              ItemDataSize;
-  CHAR16              *GuidStr;
-  EFI_STRING_ID       GuidID;
+  CHAR16              *CertificateInfoStr;
+  CHAR8               *CertificateInfoStr8;
+  EFI_STRING_ID       CertificateInfoID;
   EFI_STRING_ID       Help;
+  UINTN               CertificateInfoStrSize;
+  CHAR16*             UNKNOWN_CERT = L"Unknown Certificate: No Common Name, No Issuer";
+  RETURN_STATUS       RStatus;
 
-  Data              = NULL;
-  CertList          = NULL;
-  Cert              = NULL;
-  GuidStr           = NULL;
-  StartOpCodeHandle = NULL;
-  EndOpCodeHandle   = NULL;
+  Data                    = NULL;
+  CertList                = NULL;
+  Cert                    = NULL;
+  CertificateInfoStr      = NULL;
+  CertificateInfoStr8     = NULL;
+  StartOpCodeHandle       = NULL;
+  EndOpCodeHandle         = NULL;
+  CertificateInfoStrSize  = 0;
+  RStatus                 = RETURN_SUCCESS;
 
   //
   // Initialize the container for dynamic opcodes.
@@ -2606,12 +2614,6 @@ UpdateDeletePage (
     goto ON_EXIT;
   }
 
-  GuidStr = AllocateZeroPool (100);
-  if (GuidStr == NULL) {
-    Status = EFI_OUT_OF_RESOURCES;
-    goto ON_EXIT;
-  }
-
   //
   // Enumerate all KEK pub data.
   //
@@ -2649,22 +2651,59 @@ UpdateDeletePage (
                                     + sizeof (EFI_SIGNATURE_LIST)
                                     + CertList->SignatureHeaderSize
                                     + Index * CertList->SignatureSize);
+
+      // Get the required buffer size
+      X509GetCommonName (
+        (UINT8*)Cert->SignatureData,
+        (UINTN)CertList->SignatureSize,
+        NULL,
+        &CertificateInfoStrSize
+        );
+
+      CertificateInfoStr8 = AllocateZeroPool (CertificateInfoStrSize * sizeof(CHAR8));
+      if (CertificateInfoStr8 == NULL) {
+        Status = EFI_OUT_OF_RESOURCES;
+        goto ON_EXIT;
+      }
+      CertificateInfoStr = AllocateZeroPool (CertificateInfoStrSize * sizeof(CHAR16));
+      if (CertificateInfoStr == NULL) {
+        Status = EFI_OUT_OF_RESOURCES;
+        goto ON_EXIT;
+      }
+
       //
       // Display GUID and help
       //
-      GuidToString (&Cert->SignatureOwner, GuidStr, 100);
-      GuidID = HiiSetString (PrivateData->HiiHandle, 0, GuidStr, NULL);
+      RStatus = X509GetCommonName (
+        (UINT8*)Cert->SignatureData,
+        (UINTN)CertList->SignatureSize,
+        CertificateInfoStr8,
+        &CertificateInfoStrSize
+        );
+
+      if (!EFI_ERROR (RStatus)) {
+        AsciiStrToUnicodeStrS (CertificateInfoStr8, CertificateInfoStr, CertificateInfoStrSize);
+        CertificateInfoID  = HiiSetString (PrivateData->HiiHandle, 0, CertificateInfoStr, NULL);
+      } else {
+        CertificateInfoID  = HiiSetString (PrivateData->HiiHandle, 0, UNKNOWN_CERT, NULL);
+      }
+
       HiiCreateCheckBoxOpCode (
         StartOpCodeHandle,
         (EFI_QUESTION_ID)(QuestionIdBase + GuidIndex++),
         0,
         0,
-        GuidID,
+        CertificateInfoID,
         Help,
         EFI_IFR_FLAG_CALLBACK | EFI_IFR_FLAG_RESET_REQUIRED,
         0,
         NULL
         );
+
+      FreePool (CertificateInfoStr8);
+      FreePool (CertificateInfoStr);
+      CertificateInfoStr8 = NULL;
+      CertificateInfoStr = NULL;
     }
 
     ItemDataSize -= CertList->SignatureListSize;
@@ -2692,8 +2731,12 @@ ON_EXIT:
     FreePool (Data);
   }
 
-  if (GuidStr != NULL) {
-    FreePool (GuidStr);
+  if (CertificateInfoStr != NULL) {
+    FreePool (CertificateInfoStr);
+  }
+
+  if (CertificateInfoStr8 != NULL) {
+    FreePool (CertificateInfoStr8);
   }
 
   return EFI_SUCCESS;
@@ -4600,6 +4643,10 @@ SecureBootCallback (
   UINT16                          LabelId;
   UINT8                           *SecureBootEnable;
   UINT8                           *Pk;
+  EFI_SIGNATURE_LIST              *PkList;
+  EFI_SIGNATURE_DATA              *PkCert;
+  CHAR8                           *PkCN8;
+  CHAR16                          *PkCN16;
   UINT8                           *SecureBootMode;
   UINT8                           *SetupMode;
   CHAR16                          PromptString[100];
@@ -4611,12 +4658,19 @@ SecureBootCallback (
   ENROLL_KEY_ERROR                EnrollKeyErrorCode;
   EFI_HII_POPUP_PROTOCOL          *HiiPopup;
   EFI_HII_POPUP_SELECTION         UserSelection;
+  CHAR16* UNKNOWN_CERT = L"Unknown Certificate: No Common Name, No Issuer";
 
   Status             = EFI_SUCCESS;
+  RStatus            = RETURN_SUCCESS;
   SecureBootEnable   = NULL;
   SecureBootMode     = NULL;
   SetupMode          = NULL;
   File               = NULL;
+  PkList             = NULL;
+  PkCert             = NULL;
+  PkCN8              = NULL;
+  PkCN16             = NULL;
+
   EnrollKeyErrorCode = None_Error;
 
   if ((This == NULL) || (Value == NULL) || (ActionRequest == NULL)) {
@@ -4651,8 +4705,51 @@ SecureBootCallback (
       // When entering SecureBoot OPTION Form
       // always close opened file & free resource
       //
-      if ((QuestionId == KEY_SECURE_BOOT_PK_OPTION) ||
-          (QuestionId == KEY_SECURE_BOOT_KEK_OPTION) ||
+      if ((QuestionId == KEY_SECURE_BOOT_PK_OPTION)) {
+        CloseEnrolledFile (Private->FileContext);
+
+        GetVariable2 (EFI_PLATFORM_KEY_NAME, &gEfiGlobalVariableGuid, (VOID **)&PkList, NULL);
+        if (PkList != NULL) {
+          // Extract the PK certificate from the list
+          PkCert = (EFI_SIGNATURE_DATA *)((UINT8 *)PkList + sizeof (EFI_SIGNATURE_LIST) + PkList->SignatureHeaderSize);
+
+          // Get the required buffer size
+          UINTN cnSize = 0;
+          X509GetCommonName (
+            (UINT8*)PkCert->SignatureData,
+            (UINTN)PkList->SignatureSize,
+            NULL,
+            &cnSize
+            );
+
+          PkCN8 = AllocateZeroPool (cnSize * sizeof(CHAR8));
+          if (PkCN8 == NULL) {
+            Status = EFI_OUT_OF_RESOURCES;
+            goto EXIT;
+          }
+          PkCN16 = AllocateZeroPool (cnSize * sizeof(CHAR16));
+          if (PkCN16 == NULL) {
+            Status = EFI_OUT_OF_RESOURCES;
+            goto EXIT;
+          }
+
+          RStatus = X509GetCommonName (
+            (UINT8*)PkCert->SignatureData,
+            (UINTN)PkList->SignatureSize,
+            PkCN8,
+            &cnSize
+            );
+
+          if (!EFI_ERROR (RStatus)) {
+            AsciiStrToUnicodeStrS (PkCN8, PkCN16, cnSize);
+            HiiSetString (Private->HiiHandle, STRING_TOKEN (STR_PK_NAME), PkCN16, NULL);
+          } else {
+            HiiSetString (Private->HiiHandle, STRING_TOKEN (STR_PK_NAME), UNKNOWN_CERT, NULL);
+          }
+        }
+      }
+
+      if ((QuestionId == KEY_SECURE_BOOT_KEK_OPTION) ||
           (QuestionId == KEY_SECURE_BOOT_DB_OPTION) ||
           (QuestionId == KEY_SECURE_BOOT_DBX_OPTION) ||
           (QuestionId == KEY_SECURE_BOOT_DBT_OPTION))
@@ -5306,6 +5403,18 @@ EXIT:
   if (File != NULL) {
     FreePool (File);
     File = NULL;
+  }
+
+  if (PkCN8 != NULL) {
+    FreePool (PkCN8);
+  }
+
+  if (PkCN16 != NULL) {
+    FreePool (PkCN16);
+  }
+
+  if (PkList != NULL) {
+    FreePool (PkList);
   }
 
   return EFI_SUCCESS;
